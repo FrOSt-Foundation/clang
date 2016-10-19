@@ -103,6 +103,10 @@ public:
   bool operator<(const FileEntry &RHS) const {
     return Device < RHS.Device || (Device == RHS.Device && Inode < RHS.Inode);
   }
+
+  /// \brief Check whether the file is a named pipe (and thus can't be opened by
+  /// the native FileManager methods).
+  bool isNamedPipe() const;
 };
 
 /// \brief Implements support for file system lookup, file system caching,
@@ -186,6 +190,9 @@ public:
   /// \brief Removes the specified FileSystemStatCache object from the manager.
   void removeStatCache(FileSystemStatCache *statCache);
 
+  /// \brief Removes all FileSystemStatCache objects from the manager.
+  void clearStatCaches();
+
   /// \brief Lookup, cache, and verify the specified directory (real or
   /// virtual).
   ///
@@ -221,7 +228,8 @@ public:
   /// \brief Open the specified file as a MemoryBuffer, returning a new
   /// MemoryBuffer if successful, otherwise returning null.
   llvm::MemoryBuffer *getBufferForFile(const FileEntry *Entry,
-                                       std::string *ErrorStr = 0);
+                                       std::string *ErrorStr = 0,
+                                       bool isVolatile = false);
   llvm::MemoryBuffer *getBufferForFile(StringRef Filename,
                                        std::string *ErrorStr = 0);
 
@@ -232,7 +240,7 @@ public:
   bool getNoncachedStatValue(StringRef Path, struct stat &StatBuf);
 
   /// \brief Remove the real file \p Entry from the cache.
-  void InvalidateCache(const FileEntry* Entry);
+  void invalidateCache(const FileEntry *Entry);
 
   /// \brief If path is not absolute and FileSystemOptions set the working
   /// directory, the path is modified to be relative to the given

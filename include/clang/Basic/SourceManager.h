@@ -36,6 +36,7 @@
 #define LLVM_CLANG_SOURCEMANAGER_H
 
 #include "clang/Basic/LLVM.h"
+#include "clang/Basic/FileManager.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
@@ -61,7 +62,6 @@ class LangOptions;
 class ASTWriter;
 class ASTReader;
 
-/// \namespace
 /// \brief Public enums and private classes that are part of the
 /// SourceManager implementation.
 ///
@@ -127,14 +127,20 @@ namespace SrcMgr {
     /// When true, the original entry may be a virtual file that does not
     /// exist.
     unsigned BufferOverridden : 1;
+
+    /// \brief True if this content cache was initially created for a source
+    /// file considered as a system one.
+    unsigned IsSystemFile : 1;
     
     ContentCache(const FileEntry *Ent = 0)
       : Buffer(0, false), OrigEntry(Ent), ContentsEntry(Ent),
-        SourceLineCache(0), NumLines(0), BufferOverridden(false) {}
+        SourceLineCache(0), NumLines(0), BufferOverridden(false),
+        IsSystemFile(false) {}
     
     ContentCache(const FileEntry *Ent, const FileEntry *contentEnt)
       : Buffer(0, false), OrigEntry(Ent), ContentsEntry(contentEnt),
-        SourceLineCache(0), NumLines(0), BufferOverridden(false) {}
+        SourceLineCache(0), NumLines(0), BufferOverridden(false),
+        IsSystemFile(false) {}
     
     ~ContentCache();
     
@@ -142,7 +148,8 @@ namespace SrcMgr {
     /// a non-NULL Buffer or SourceLineCache.  Ownership of allocated memory
     /// is not transferred, so this is a logical error.
     ContentCache(const ContentCache &RHS)
-      : Buffer(0, false), SourceLineCache(0), BufferOverridden(false)
+      : Buffer(0, false), SourceLineCache(0), BufferOverridden(false),
+        IsSystemFile(false)
     {
       OrigEntry = RHS.OrigEntry;
       ContentsEntry = RHS.ContentsEntry;
@@ -213,7 +220,7 @@ namespace SrcMgr {
 
   private:
     // Disable assignments.
-    ContentCache &operator=(const ContentCache& RHS);
+    ContentCache &operator=(const ContentCache& RHS) LLVM_DELETED_FUNCTION;
   };
 
   /// \brief Information about a FileID, basically just the logical file
@@ -533,6 +540,10 @@ class SourceManager : public RefCountedBase<SourceManager> {
   /// files, should report the original file name. Defaults to true.
   bool OverridenFilesKeepOriginalName;
 
+  /// \brief True if non-system source files should be treated as volatile
+  /// (likely to change while trying to use them). Defaults to false.
+  bool UserFilesAreVolatile;
+
   struct OverriddenFilesInfoTy {
     /// \brief Files that have been overriden with the contents from another
     /// file.
@@ -635,10 +646,11 @@ class SourceManager : public RefCountedBase<SourceManager> {
   mutable llvm::DenseMap<FileID, MacroArgsMap *> MacroArgsCacheMap;
 
   // SourceManager doesn't support copy construction.
-  explicit SourceManager(const SourceManager&);
-  void operator=(const SourceManager&);
+  explicit SourceManager(const SourceManager&) LLVM_DELETED_FUNCTION;
+  void operator=(const SourceManager&) LLVM_DELETED_FUNCTION;
 public:
-  SourceManager(DiagnosticsEngine &Diag, FileManager &FileMgr);
+  SourceManager(DiagnosticsEngine &Diag, FileManager &FileMgr,
+                bool UserFilesAreVolatile = false);
   ~SourceManager();
 
   void clearIDTables();
@@ -653,14 +665,19 @@ public:
     OverridenFilesKeepOriginalName = value;
   }
 
+  /// \brief True if non-system source files should be treated as volatile
+  /// (likely to change while trying to use them).
+  bool userFilesAreVolatile() const { return UserFilesAreVolatile; }
+
   /// \brief Create the FileID for a memory buffer that will represent the
   /// FileID for the main source.
   ///
   /// One example of when this would be used is when the main source is read
   /// from STDIN.
-  FileID createMainFileIDForMemBuffer(const llvm::MemoryBuffer *Buffer) {
+  FileID createMainFileIDForMemBuffer(const llvm::MemoryBuffer *Buffer,
+                             SrcMgr::CharacteristicKind Kind = SrcMgr::C_User) {
     assert(MainFileID.isInvalid() && "MainFileID already set!");
-    MainFileID = createFileIDForMemBuffer(Buffer);
+    MainFileID = createFileIDForMemBuffer(Buffer, Kind);
     return MainFileID;
   }
 
@@ -705,7 +722,9 @@ public:
   FileID createFileID(const FileEntry *SourceFile, SourceLocation IncludePos,
                       SrcMgr::CharacteristicKind FileCharacter,
                       int LoadedID = 0, unsigned LoadedOffset = 0) {
-    const SrcMgr::ContentCache *IR = getOrCreateContentCache(SourceFile);
+    const SrcMgr::ContentCache *
+      IR = getOrCreateContentCache(SourceFile,
+                              /*isSystemFile=*/FileCharacter != SrcMgr::C_User);
     assert(IR && "getOrCreateContentCache() cannot return NULL");
     return createFileID(IR, IncludePos, FileCharacter, LoadedID, LoadedOffset);
   }
@@ -715,10 +734,11 @@ public:
   /// This does no caching of the buffer and takes ownership of the
   /// MemoryBuffer, so only pass a MemoryBuffer to this once.
   FileID createFileIDForMemBuffer(const llvm::MemoryBuffer *Buffer,
+                      SrcMgr::CharacteristicKind FileCharacter = SrcMgr::C_User,
                                   int LoadedID = 0, unsigned LoadedOffset = 0,
                                  SourceLocation IncludeLoc = SourceLocation()) {
     return createFileID(createMemBufferContentCache(Buffer), IncludeLoc,
-                        SrcMgr::C_User, LoadedID, LoadedOffset);
+                        FileCharacter, LoadedID, LoadedOffset);
   }
 
   /// \brief Return a new SourceLocation that encodes the
@@ -760,7 +780,7 @@ public:
                             const llvm::MemoryBuffer *Buffer,
                             bool DoNotFree = false);
 
-  /// \brief Override the the given source file with another one.
+  /// \brief Override the given source file with another one.
   ///
   /// \param SourceFile the source file which will be overriden.
   ///
@@ -895,6 +915,13 @@ public:
       return LastFileIDLookup;
 
     return getFileIDSlow(SLocOffset);
+  }
+
+  /// \brief Return the filename of the file containing a SourceLocation.
+  StringRef getFilename(SourceLocation SpellingLoc) const {
+    if (const FileEntry *F = getFileEntryForID(getFileID(SpellingLoc)))
+      return F->getName();
+    return StringRef();
   }
 
   /// \brief Return the source location corresponding to the first byte of
@@ -1491,13 +1518,12 @@ private:
       return true;
 
     // If it is the last local entry, then it does if the location is local.
-    if (static_cast<unsigned>(FID.ID+1) == LocalSLocEntryTable.size()) {
+    if (FID.ID+1 == static_cast<int>(LocalSLocEntryTable.size()))
       return SLocOffset < NextLocalOffset;
-    }
 
     // Otherwise, the entry after it has to not include it. This works for both
     // local and loaded entries.
-    return SLocOffset < getSLocEntry(FileID::get(FID.ID+1)).getOffset();
+    return SLocOffset < getSLocEntryByID(FID.ID+1).getOffset();
   }
 
   /// \brief Create a new fileID for the specified ContentCache and
@@ -1511,7 +1537,8 @@ private:
                       int LoadedID, unsigned LoadedOffset);
 
   const SrcMgr::ContentCache *
-    getOrCreateContentCache(const FileEntry *SourceFile);
+    getOrCreateContentCache(const FileEntry *SourceFile,
+                            bool isSystemFile = false);
 
   /// \brief Create a new ContentCache for the specified  memory buffer.
   const SrcMgr::ContentCache*
@@ -1531,7 +1558,11 @@ private:
   getDecomposedSpellingLocSlowCase(const SrcMgr::SLocEntry *E,
                                    unsigned Offset) const;
   void computeMacroArgsCache(MacroArgsMap *&MacroArgsCache, FileID FID) const;
-
+  void associateFileChunkWithMacroArgExp(MacroArgsMap &MacroArgsCache,
+                                         FileID FID,
+                                         SourceLocation SpellLoc,
+                                         SourceLocation ExpansionLoc,
+                                         unsigned ExpansionLength) const;
   friend class ASTReader;
   friend class ASTWriter;
 };

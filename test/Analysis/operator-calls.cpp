@@ -1,4 +1,4 @@
-// RUN: %clang_cc1 -analyze -analyzer-checker=core,experimental.core,debug.ExprInspection -verify %s
+// RUN: %clang_cc1 -analyze -analyzer-checker=core,alpha.core,debug.ExprInspection -analyzer-ipa=inlining -verify %s
 void clang_analyzer_eval(bool);
 
 struct X0 { };
@@ -28,6 +28,24 @@ struct IntComparable {
 };
 
 void testMemberOperator(IntComparable B) {
-  // FIXME: Change this to TRUE when we re-enable inlining.
-  clang_analyzer_eval(B == 0); // expected-warning{{UNKNOWN}}
+  clang_analyzer_eval(B == 0); // expected-warning{{TRUE}}
+}
+
+
+
+namespace UserDefinedConversions {
+  class Convertible {
+  public:
+    operator int() const {
+      return 42;
+    }
+    operator bool() const {
+      return true;
+    }
+  };
+
+  void test(const Convertible &obj) {
+    clang_analyzer_eval((int)obj == 42); // expected-warning{{TRUE}}
+    clang_analyzer_eval(obj); // expected-warning{{TRUE}}
+  }
 }

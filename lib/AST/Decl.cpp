@@ -126,12 +126,12 @@ static LinkageInfo getLVForTemplateArgumentList(const TemplateArgument *Args,
       break;
 
     case TemplateArgument::Declaration:
-      // The decl can validly be null as the representation of nullptr
-      // arguments, valid only in C++0x.
-      if (Decl *D = Args[I].getAsDecl()) {
-        if (NamedDecl *ND = dyn_cast<NamedDecl>(D))
-          LV.mergeWithMin(getLVForDecl(ND, OnlyTemplate));
-      }
+      if (NamedDecl *ND = dyn_cast<NamedDecl>(Args[I].getAsDecl()))
+        LV.mergeWithMin(getLVForDecl(ND, OnlyTemplate));
+      break;
+
+    case TemplateArgument::NullPtr:
+      LV.mergeWithMin(getLVForType(Args[I].getNullPtrType()));
       break;
 
     case TemplateArgument::Template:
@@ -168,6 +168,34 @@ shouldConsiderTemplateVis(const ClassTemplateSpecializationDecl *d) {
   return !d->hasAttr<VisibilityAttr>() || d->isExplicitSpecialization();
 }
 
+static bool useInlineVisibilityHidden(const NamedDecl *D) {
+  // FIXME: we should warn if -fvisibility-inlines-hidden is used with c.
+  const LangOptions &Opts = D->getASTContext().getLangOpts();
+  if (!Opts.CPlusPlus || !Opts.InlineVisibilityHidden)
+    return false;
+
+  const FunctionDecl *FD = dyn_cast<FunctionDecl>(D);
+  if (!FD)
+    return false;
+
+  TemplateSpecializationKind TSK = TSK_Undeclared;
+  if (FunctionTemplateSpecializationInfo *spec
+      = FD->getTemplateSpecializationInfo()) {
+    TSK = spec->getTemplateSpecializationKind();
+  } else if (MemberSpecializationInfo *MSI =
+             FD->getMemberSpecializationInfo()) {
+    TSK = MSI->getTemplateSpecializationKind();
+  }
+
+  const FunctionDecl *Def = 0;
+  // InlineVisibilityHidden only applies to definitions, and
+  // isInlined() only gives meaningful answers on definitions
+  // anyway.
+  return TSK != TSK_ExplicitInstantiationDeclaration &&
+    TSK != TSK_ExplicitInstantiationDefinition &&
+    FD->hasBody(Def) && Def->isInlined() && !Def->hasAttr<GNUInlineAttr>();
+}
+
 static LinkageInfo getLVForNamespaceScopeDecl(const NamedDecl *D,
                                               bool OnlyTemplate) {
   assert(D->getDeclContext()->getRedeclContext()->isFileContext() &&
@@ -185,12 +213,12 @@ static LinkageInfo getLVForNamespaceScopeDecl(const NamedDecl *D,
     if (Var->getStorageClass() == SC_Static)
       return LinkageInfo::internal();
 
-    // - an object or reference that is explicitly declared const
-    //   and neither explicitly declared extern nor previously
-    //   declared to have external linkage; or
-    // (there is no equivalent in C99)
+    // - a non-volatile object or reference that is explicitly declared const
+    //   or constexpr and neither explicitly declared extern nor previously
+    //   declared to have external linkage; or (there is no equivalent in C99)
     if (Context.getLangOpts().CPlusPlus &&
-        Var->getType().isConstant(Context) && 
+        Var->getType().isConstQualified() && 
+        !Var->getType().isVolatileQualified() &&
         Var->getStorageClass() != SC_Extern &&
         Var->getStorageClass() != SC_PrivateExtern) {
       bool FoundExtern = false;
@@ -208,8 +236,8 @@ static LinkageInfo getLVForNamespaceScopeDecl(const NamedDecl *D,
       for (; PrevVar; PrevVar = PrevVar->getPreviousDecl())
         if (PrevVar->getStorageClass() == SC_PrivateExtern)
           break;
-        if (PrevVar)
-          return PrevVar->getLinkageAndVisibility();
+      if (PrevVar)
+        return PrevVar->getLinkageAndVisibility();
     }
   } else if (isa<FunctionDecl>(D) || isa<FunctionTemplateDecl>(D)) {
     // C++ [temp]p4:
@@ -266,8 +294,13 @@ static LinkageInfo getLVForNamespaceScopeDecl(const NamedDecl *D,
     }
   }
 
-  if (!OnlyTemplate)
+  if (!OnlyTemplate) {
     LV.mergeVisibility(Context.getLangOpts().getVisibilityMode());
+    // If we're paying attention to global visibility, apply
+    // -finline-visibility-hidden if this is an inline method.
+    if (!LV.visibilityExplicit() && useInlineVisibilityHidden(D))
+      LV.mergeVisibility(HiddenVisibility, true);
+  }
 
   // C++ [basic.link]p4:
 
@@ -308,25 +341,9 @@ static LinkageInfo getLVForNamespaceScopeDecl(const NamedDecl *D,
     if (Var->getStorageClass() == SC_PrivateExtern)
       LV.mergeVisibility(HiddenVisibility, true);
 
-    if (!Context.getLangOpts().CPlusPlus &&
-        (Var->getStorageClass() == SC_Extern ||
-         Var->getStorageClass() == SC_PrivateExtern)) {
-
-      // C99 6.2.2p4:
-      //   For an identifier declared with the storage-class specifier
-      //   extern in a scope in which a prior declaration of that
-      //   identifier is visible, if the prior declaration specifies
-      //   internal or external linkage, the linkage of the identifier
-      //   at the later declaration is the same as the linkage
-      //   specified at the prior declaration. If no prior declaration
-      //   is visible, or if the prior declaration specifies no
-      //   linkage, then the identifier has external linkage.
-      if (const VarDecl *PrevVar = Var->getPreviousDecl()) {
-        LinkageInfo PrevLV = getLVForDecl(PrevVar, OnlyTemplate);
-        if (PrevLV.linkage()) LV.setLinkage(PrevLV.linkage());
-        LV.mergeVisibility(PrevLV);
-      }
-    }
+    // Note that Sema::MergeVarDecl already takes care of implementing
+    // C99 6.2.2p4 and propagating the visibility attribute, so we don't have
+    // to do it here.
 
   //     - a function, unless it has internal linkage; or
   } else if (const FunctionDecl *Function = dyn_cast<FunctionDecl>(D)) {
@@ -473,40 +490,19 @@ static LinkageInfo getLVForClassMember(const NamedDecl *D, bool OnlyTemplate) {
   if (!OnlyTemplate) {
     if (llvm::Optional<Visibility> Vis = D->getExplicitVisibility())
       LV.mergeVisibility(*Vis, true);
+    // If we're paying attention to global visibility, apply
+    // -finline-visibility-hidden if this is an inline method.
+    //
+    // Note that we do this before merging information about
+    // the class visibility.
+    if (!LV.visibilityExplicit() && useInlineVisibilityHidden(D))
+      LV.mergeVisibility(HiddenVisibility, true);
   }
 
   // If this class member has an explicit visibility attribute, the only
   // thing that can change its visibility is the template arguments, so
-  // only look for them when processing the the class.
+  // only look for them when processing the class.
   bool ClassOnlyTemplate =  LV.visibilityExplicit() ? true : OnlyTemplate;
-
-  // If we're paying attention to global visibility, apply
-  // -finline-visibility-hidden if this is an inline method.
-  //
-  // Note that we do this before merging information about
-  // the class visibility.
-  if (const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(D)) {
-    TemplateSpecializationKind TSK = TSK_Undeclared;
-    if (FunctionTemplateSpecializationInfo *spec
-        = MD->getTemplateSpecializationInfo()) {
-      TSK = spec->getTemplateSpecializationKind();
-    } else if (MemberSpecializationInfo *MSI =
-               MD->getMemberSpecializationInfo()) {
-      TSK = MSI->getTemplateSpecializationKind();
-    }
-
-    const FunctionDecl *Def = 0;
-    // InlineVisibilityHidden only applies to definitions, and
-    // isInlined() only gives meaningful answers on definitions
-    // anyway.
-    if (TSK != TSK_ExplicitInstantiationDeclaration &&
-        TSK != TSK_ExplicitInstantiationDefinition &&
-        !OnlyTemplate &&
-        !LV.visibilityExplicit() &&
-        MD->getASTContext().getLangOpts().InlineVisibilityHidden &&
-        MD->hasBody(Def) && Def->isInlined())
-      LV.mergeVisibility(HiddenVisibility, true);
-  }
 
   // If this member has an visibility attribute, ClassF will exclude
   // attributes on the class or command line options, keeping only information
@@ -698,6 +694,10 @@ llvm::Optional<Visibility> NamedDecl::getExplicitVisibility() const {
   if (llvm::Optional<Visibility> V = getVisibilityOf(this))
     return V;
 
+  // The visibility of a template is stored in the templated decl.
+  if (const TemplateDecl *TD = dyn_cast<TemplateDecl>(this))
+    return getVisibilityOf(TD->getTemplatedDecl());
+
   // If there wasn't explicit visibility there, and this is a
   // specialization of a class template, check for visibility
   // on the pattern.
@@ -825,13 +825,10 @@ static LinkageInfo getLVForDecl(const NamedDecl *D, bool OnlyTemplate) {
           if (llvm::Optional<Visibility> Vis = Var->getExplicitVisibility())
             LV.mergeVisibility(*Vis, true);
         }
-        
-        if (const VarDecl *Prev = Var->getPreviousDecl()) {
-          LinkageInfo PrevLV = getLVForDecl(Prev, OnlyTemplate);
-          if (PrevLV.linkage()) LV.setLinkage(PrevLV.linkage());
-          LV.mergeVisibility(PrevLV);
-        }
 
+        // Note that Sema::MergeVarDecl already takes care of implementing
+        // C99 6.2.2p4 and propagating the visibility attribute, so we don't
+        // have to do it here.
         return LV;
       }
   }
@@ -887,7 +884,7 @@ std::string NamedDecl::getQualifiedNameAsString(const PrintingPolicy &P) const {
     } else if (const FunctionDecl *FD = dyn_cast<FunctionDecl>(*I)) {
       const FunctionProtoType *FT = 0;
       if (FD->hasWrittenPrototype())
-        FT = dyn_cast<FunctionProtoType>(FD->getType()->getAs<FunctionType>());
+        FT = dyn_cast<FunctionProtoType>(FD->getType()->castAs<FunctionType>());
 
       OS << *FD << '(';
       if (FT) {
@@ -1188,8 +1185,11 @@ void VarDecl::setStorageClass(StorageClass SC) {
 }
 
 SourceRange VarDecl::getSourceRange() const {
-  if (getInit())
-    return SourceRange(getOuterLocStart(), getInit()->getLocEnd());
+  if (const Expr *Init = getInit()) {
+    SourceLocation InitEnd = Init->getLocEnd();
+    if (InitEnd.isValid())
+      return SourceRange(getOuterLocStart(), InitEnd);
+  }
   return DeclaratorDecl::getSourceRange();
 }
 
@@ -1843,7 +1843,7 @@ unsigned FunctionDecl::getBuiltinID() const {
 /// based on its FunctionType.  This is the length of the ParamInfo array
 /// after it has been created.
 unsigned FunctionDecl::getNumParams() const {
-  const FunctionType *FT = getType()->getAs<FunctionType>();
+  const FunctionType *FT = getType()->castAs<FunctionType>();
   if (isa<FunctionNoProtoType>(FT))
     return 0;
   return cast<FunctionProtoType>(FT)->getNumArgs();
@@ -2498,7 +2498,7 @@ unsigned FieldDecl::getFieldIndex() const {
   unsigned Index = 0;
   const RecordDecl *RD = getParent();
   const FieldDecl *LastFD = 0;
-  bool IsMsStruct = RD->hasAttr<MsStructAttr>();
+  bool IsMsStruct = RD->isMsStruct(getASTContext());
 
   for (RecordDecl::field_iterator I = RD->field_begin(), E = RD->field_end();
        I != E; ++I, ++Index) {
@@ -2746,6 +2746,17 @@ void RecordDecl::completeDefinition() {
   TagDecl::completeDefinition();
 }
 
+/// isMsStruct - Get whether or not this record uses ms_struct layout.
+/// This which can be turned on with an attribute, pragma, or the
+/// -mms-bitfields command-line option.
+bool RecordDecl::isMsStruct(const ASTContext &C) const {
+  return hasAttr<MsStructAttr>() || C.getLangOpts().MSBitfields == 1;
+}
+
+static bool isFieldOrIndirectField(Decl::Kind K) {
+  return FieldDecl::classofKind(K) || IndirectFieldDecl::classofKind(K);
+}
+
 void RecordDecl::LoadFieldsFromExternalStorage() const {
   ExternalASTSource *Source = getASTContext().getExternalSource();
   assert(hasExternalLexicalStorage() && Source && "No external storage?");
@@ -2755,7 +2766,8 @@ void RecordDecl::LoadFieldsFromExternalStorage() const {
 
   SmallVector<Decl*, 64> Decls;
   LoadedFieldsFromExternalStorage = true;  
-  switch (Source->FindExternalLexicalDeclsBy<FieldDecl>(this, Decls)) {
+  switch (Source->FindExternalLexicalDecls(this, isFieldOrIndirectField,
+                                           Decls)) {
   case ELR_Success:
     break;
     
@@ -2767,7 +2779,7 @@ void RecordDecl::LoadFieldsFromExternalStorage() const {
 #ifndef NDEBUG
   // Check that all decls we got were FieldDecls.
   for (unsigned i=0, e=Decls.size(); i != e; ++i)
-    assert(isa<FieldDecl>(Decls[i]));
+    assert(isa<FieldDecl>(Decls[i]) || isa<IndirectFieldDecl>(Decls[i]));
 #endif
 
   if (Decls.empty())

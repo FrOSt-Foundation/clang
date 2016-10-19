@@ -1,4 +1,6 @@
 #include "clang/AST/CommentLexer.h"
+#include "clang/AST/CommentCommandTraits.h"
+#include "clang/Basic/ConvertUTF.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -11,80 +13,72 @@ void Token::dump(const Lexer &L, const SourceManager &SM) const {
   llvm::errs() << " " << Length << " \"" << L.getSpelling(*this, SM) << "\"\n";
 }
 
-bool Lexer::isVerbatimBlockCommand(StringRef BeginName,
-                                  StringRef &EndName) const {
-  const char *Result = llvm::StringSwitch<const char *>(BeginName)
-    .Case("code", "endcode")
-    .Case("verbatim", "endverbatim")
-    .Case("htmlonly", "endhtmlonly")
-    .Case("latexonly", "endlatexonly")
-    .Case("xmlonly", "endxmlonly")
-    .Case("manonly", "endmanonly")
-    .Case("rtfonly", "endrtfonly")
-
-    .Case("dot", "enddot")
-    .Case("msc", "endmsc")
-
-    .Case("f$", "f$") // Inline LaTeX formula
-    .Case("f[", "f]") // Displayed LaTeX formula
-    .Case("f{", "f}") // LaTeX environment
-
-    .Default(NULL);
-
-  if (Result) {
-    EndName = Result;
-    return true;
-  }
-
-  for (VerbatimBlockCommandVector::const_iterator
-           I = VerbatimBlockCommands.begin(),
-           E = VerbatimBlockCommands.end();
-       I != E; ++I)
-    if (I->BeginName == BeginName) {
-      EndName = I->EndName;
-      return true;
-    }
-
-  return false;
+namespace {
+bool isHTMLNamedCharacterReferenceCharacter(char C) {
+  return (C >= 'a' && C <= 'z') ||
+         (C >= 'A' && C <= 'Z');
 }
 
-bool Lexer::isVerbatimLineCommand(StringRef Name) const {
-  bool Result = llvm::StringSwitch<bool>(Name)
-  .Case("fn", true)
-  .Case("var", true)
-  .Case("property", true)
-  .Case("typedef", true)
+bool isHTMLDecimalCharacterReferenceCharacter(char C) {
+  return C >= '0' && C <= '9';
+}
 
-  .Case("overload", true)
+bool isHTMLHexCharacterReferenceCharacter(char C) {
+  return (C >= '0' && C <= '9') ||
+         (C >= 'a' && C <= 'f') ||
+         (C >= 'A' && C <= 'F');
+}
 
-  .Case("defgroup", true)
-  .Case("ingroup", true)
-  .Case("addtogroup", true)
-  .Case("weakgroup", true)
-  .Case("name", true)
+#include "clang/AST/CommentHTMLTags.inc"
 
-  .Case("section", true)
-  .Case("subsection", true)
-  .Case("subsubsection", true)
-  .Case("paragraph", true)
+} // unnamed namespace
 
-  .Case("mainpage", true)
-  .Case("subpage", true)
-  .Case("ref", true)
+StringRef Lexer::resolveHTMLNamedCharacterReference(StringRef Name) const {
+  return llvm::StringSwitch<StringRef>(Name)
+      .Case("amp", "&")
+      .Case("lt", "<")
+      .Case("gt", ">")
+      .Case("quot", "\"")
+      .Case("apos", "\'")
+      .Default("");
+}
 
-  .Default(false);
+StringRef Lexer::resolveHTMLDecimalCharacterReference(StringRef Name) const {
+  unsigned CodePoint = 0;
+  for (unsigned i = 0, e = Name.size(); i != e; ++i) {
+    assert(isHTMLDecimalCharacterReferenceCharacter(Name[i]));
+    CodePoint *= 10;
+    CodePoint += Name[i] - '0';
+  }
 
-  if (Result)
-    return true;
+  char *Resolved = Allocator.Allocate<char>(UNI_MAX_UTF8_BYTES_PER_CODE_POINT);
+  char *ResolvedPtr = Resolved;
+  if (ConvertCodePointToUTF8(CodePoint, ResolvedPtr))
+    return StringRef(Resolved, ResolvedPtr - Resolved);
+  else
+    return StringRef();
+}
 
-  for (VerbatimLineCommandVector::const_iterator
-           I = VerbatimLineCommands.begin(),
-           E = VerbatimLineCommands.end();
-       I != E; ++I)
-    if (I->Name == Name)
-      return true;
+StringRef Lexer::resolveHTMLHexCharacterReference(StringRef Name) const {
+  unsigned CodePoint = 0;
+  for (unsigned i = 0, e = Name.size(); i != e; ++i) {
+    CodePoint *= 16;
+    const char C = Name[i];
+    assert(isHTMLHexCharacterReferenceCharacter(C));
+    if (C >= '0' && C <= '9')
+      CodePoint += Name[i] - '0';
+    else if (C >= 'a' && C <= 'f')
+      CodePoint += Name[i] - 'a' + 10;
+    else
+      CodePoint += Name[i] - 'A' + 10;
+  }
 
-  return false;
+  char *Resolved = Allocator.Allocate<char>(UNI_MAX_UTF8_BYTES_PER_CODE_POINT);
+  char *ResolvedPtr = Resolved;
+  if (ConvertCodePointToUTF8(CodePoint, ResolvedPtr))
+    return StringRef(Resolved, ResolvedPtr - Resolved);
+  else
+    return StringRef();
 }
 
 void Lexer::skipLineStartingDecorations() {
@@ -122,6 +116,7 @@ void Lexer::skipLineStartingDecorations() {
 }
 
 namespace {
+/// Returns pointer to the first newline character in the string.
 const char *findNewline(const char *BufferPtr, const char *BufferEnd) {
   for ( ; BufferPtr != BufferEnd; ++BufferPtr) {
     const char C = *BufferPtr;
@@ -144,6 +139,38 @@ const char *skipNewline(const char *BufferPtr, const char *BufferEnd) {
       BufferPtr++;
   }
   return BufferPtr;
+}
+
+const char *skipNamedCharacterReference(const char *BufferPtr,
+                                        const char *BufferEnd) {
+  for ( ; BufferPtr != BufferEnd; ++BufferPtr) {
+    if (!isHTMLNamedCharacterReferenceCharacter(*BufferPtr))
+      return BufferPtr;
+  }
+  return BufferEnd;
+}
+
+const char *skipDecimalCharacterReference(const char *BufferPtr,
+                                          const char *BufferEnd) {
+  for ( ; BufferPtr != BufferEnd; ++BufferPtr) {
+    if (!isHTMLDecimalCharacterReferenceCharacter(*BufferPtr))
+      return BufferPtr;
+  }
+  return BufferEnd;
+}
+
+const char *skipHexCharacterReference(const char *BufferPtr,
+                                          const char *BufferEnd) {
+  for ( ; BufferPtr != BufferEnd; ++BufferPtr) {
+    if (!isHTMLHexCharacterReferenceCharacter(*BufferPtr))
+      return BufferPtr;
+  }
+  return BufferEnd;
+}
+
+bool isHTMLIdentifierStartingCharacter(char C) {
+  return (C >= 'a' && C <= 'z') ||
+         (C >= 'A' && C <= 'Z');
 }
 
 bool isHTMLIdentifierCharacter(char C) {
@@ -193,6 +220,15 @@ const char *skipWhitespace(const char *BufferPtr, const char *BufferEnd) {
       return BufferPtr;
   }
   return BufferEnd;
+}
+
+bool isWhitespace(const char *BufferPtr, const char *BufferEnd) {
+  return skipWhitespace(BufferPtr, BufferEnd) == BufferEnd;
+}
+
+bool isCommandNameStartCharacter(char C) {
+  return (C >= 'a' && C <= 'z') ||
+         (C >= 'A' && C <= 'Z');
 }
 
 bool isCommandNameCharacter(char C) {
@@ -267,8 +303,11 @@ void Lexer::lexCommentText(Token &T) {
   case LS_VerbatimLineText:
     lexVerbatimLineText(T);
     return;
-  case LS_HTMLOpenTag:
-    lexHTMLOpenTag(T);
+  case LS_HTMLStartTag:
+    lexHTMLStartTag(T);
+    return;
+  case LS_HTMLEndTag:
+    lexHTMLEndTag(T);
     return;
   }
 
@@ -282,9 +321,7 @@ void Lexer::lexCommentText(Token &T) {
       case '@': {
         TokenPtr++;
         if (TokenPtr == CommentEnd) {
-          StringRef Text(BufferPtr, TokenPtr - BufferPtr);
-          formTokenWithChars(T, TokenPtr, tok::text);
-          T.setText(Text);
+          formTextToken(T, TokenPtr);
           return;
         }
         char C = *TokenPtr;
@@ -308,10 +345,8 @@ void Lexer::lexCommentText(Token &T) {
         }
 
         // Don't make zero-length commands.
-        if (!isCommandNameCharacter(*TokenPtr)) {
-          StringRef Text(BufferPtr, TokenPtr - BufferPtr);
-          formTokenWithChars(T, TokenPtr, tok::text);
-          T.setText(Text);
+        if (!isCommandNameStartCharacter(*TokenPtr)) {
+          formTextToken(T, TokenPtr);
           return;
         }
 
@@ -329,39 +364,44 @@ void Lexer::lexCommentText(Token &T) {
         }
 
         const StringRef CommandName(BufferPtr + 1, Length);
-        StringRef EndName;
 
-        if (isVerbatimBlockCommand(CommandName, EndName)) {
-          setupAndLexVerbatimBlock(T, TokenPtr, *BufferPtr, EndName);
+        const CommandInfo *Info = Traits.getCommandInfoOrNULL(CommandName);
+        if (!Info) {
+          formTokenWithChars(T, TokenPtr, tok::unknown_command);
+          T.setUnknownCommandName(CommandName);
           return;
         }
-        if (isVerbatimLineCommand(CommandName)) {
-          setupAndLexVerbatimLine(T, TokenPtr);
+        if (Info->IsVerbatimBlockCommand) {
+          setupAndLexVerbatimBlock(T, TokenPtr, *BufferPtr, Info);
+          return;
+        }
+        if (Info->IsVerbatimLineCommand) {
+          setupAndLexVerbatimLine(T, TokenPtr, Info);
           return;
         }
         formTokenWithChars(T, TokenPtr, tok::command);
-        T.setCommandName(CommandName);
+        T.setCommandID(Info->getID());
         return;
       }
+
+      case '&':
+        lexHTMLCharacterReference(T);
+        return;
 
       case '<': {
         TokenPtr++;
         if (TokenPtr == CommentEnd) {
-          StringRef Text(BufferPtr, TokenPtr - BufferPtr);
-          formTokenWithChars(T, TokenPtr, tok::text);
-          T.setText(Text);
+          formTextToken(T, TokenPtr);
           return;
         }
         const char C = *TokenPtr;
-        if (isHTMLIdentifierCharacter(C))
-          setupAndLexHTMLOpenTag(T);
+        if (isHTMLIdentifierStartingCharacter(C))
+          setupAndLexHTMLStartTag(T);
         else if (C == '/')
-          lexHTMLCloseTag(T);
-        else {
-          StringRef Text(BufferPtr, TokenPtr - BufferPtr);
-          formTokenWithChars(T, TokenPtr, tok::text);
-          T.setText(Text);
-        }
+          setupAndLexHTMLEndTag(T);
+        else
+          formTextToken(T, TokenPtr);
+
         return;
       }
 
@@ -379,14 +419,12 @@ void Lexer::lexCommentText(Token &T) {
           TokenPtr++;
           if (TokenPtr == CommentEnd)
             break;
-          char C = *TokenPtr;
+          const char C = *TokenPtr;
           if(C == '\n' || C == '\r' ||
-             C == '\\' || C == '@' || C == '<')
+             C == '\\' || C == '@' || C == '&' || C == '<')
             break;
         }
-        StringRef Text(BufferPtr, TokenPtr - BufferPtr);
-        formTokenWithChars(T, TokenPtr, tok::text);
-        T.setText(Text);
+        formTextToken(T, TokenPtr);
         return;
       }
     }
@@ -395,19 +433,33 @@ void Lexer::lexCommentText(Token &T) {
 
 void Lexer::setupAndLexVerbatimBlock(Token &T,
                                      const char *TextBegin,
-                                     char Marker, StringRef EndName) {
+                                     char Marker, const CommandInfo *Info) {
+  assert(Info->IsVerbatimBlockCommand);
+
   VerbatimBlockEndCommandName.clear();
   VerbatimBlockEndCommandName.append(Marker == '\\' ? "\\" : "@");
-  VerbatimBlockEndCommandName.append(EndName);
+  VerbatimBlockEndCommandName.append(Info->EndCommandName);
 
-  StringRef Name(BufferPtr + 1, TextBegin - (BufferPtr + 1));
   formTokenWithChars(T, TextBegin, tok::verbatim_block_begin);
-  T.setVerbatimBlockName(Name);
+  T.setVerbatimBlockID(Info->getID());
+
+  // If there is a newline following the verbatim opening command, skip the
+  // newline so that we don't create an tok::verbatim_block_line with empty
+  // text content.
+  if (BufferPtr != CommentEnd) {
+    const char C = *BufferPtr;
+    if (C == '\n' || C == '\r') {
+      BufferPtr = skipNewline(BufferPtr, CommentEnd);
+      State = LS_VerbatimBlockBody;
+      return;
+    }
+  }
 
   State = LS_VerbatimBlockFirstLine;
 }
 
 void Lexer::lexVerbatimBlockFirstLine(Token &T) {
+again:
   assert(BufferPtr < CommentEnd);
 
   // FIXME: It would be better to scan the text once, finding either the block
@@ -419,24 +471,32 @@ void Lexer::lexVerbatimBlockFirstLine(Token &T) {
 
   // Look for end command in current line.
   size_t Pos = Line.find(VerbatimBlockEndCommandName);
+  const char *TextEnd;
   const char *NextLine;
   if (Pos == StringRef::npos) {
     // Current line is completely verbatim.
+    TextEnd = Newline;
     NextLine = skipNewline(Newline, CommentEnd);
   } else if (Pos == 0) {
     // Current line contains just an end command.
     const char *End = BufferPtr + VerbatimBlockEndCommandName.size();
     StringRef Name(BufferPtr + 1, End - (BufferPtr + 1));
     formTokenWithChars(T, End, tok::verbatim_block_end);
-    T.setVerbatimBlockName(Name);
+    T.setVerbatimBlockID(Traits.getCommandInfo(Name)->getID());
     State = LS_Normal;
     return;
   } else {
     // There is some text, followed by end command.  Extract text first.
-    NextLine = BufferPtr + Pos;
+    TextEnd = BufferPtr + Pos;
+    NextLine = TextEnd;
+    // If there is only whitespace before end command, skip whitespace.
+    if (isWhitespace(BufferPtr, TextEnd)) {
+      BufferPtr = TextEnd;
+      goto again;
+    }
   }
 
-  StringRef Text(BufferPtr, NextLine - BufferPtr);
+  StringRef Text(BufferPtr, TextEnd - BufferPtr);
   formTokenWithChars(T, NextLine, tok::verbatim_block_line);
   T.setVerbatimBlockText(Text);
 
@@ -452,10 +512,11 @@ void Lexer::lexVerbatimBlockBody(Token &T) {
   lexVerbatimBlockFirstLine(T);
 }
 
-void Lexer::setupAndLexVerbatimLine(Token &T, const char *TextBegin) {
-  const StringRef Name(BufferPtr + 1, TextBegin - BufferPtr - 1);
+void Lexer::setupAndLexVerbatimLine(Token &T, const char *TextBegin,
+                                    const CommandInfo *Info) {
+  assert(Info->IsVerbatimLineCommand);
   formTokenWithChars(T, TextBegin, tok::verbatim_line_name);
-  T.setVerbatimLineName(Name);
+  T.setVerbatimLineID(Info->getID());
 
   State = LS_VerbatimLineText;
 }
@@ -472,27 +533,92 @@ void Lexer::lexVerbatimLineText(Token &T) {
   State = LS_Normal;
 }
 
-void Lexer::setupAndLexHTMLOpenTag(Token &T) {
-  assert(BufferPtr[0] == '<' && isHTMLIdentifierCharacter(BufferPtr[1]));
+void Lexer::lexHTMLCharacterReference(Token &T) {
+  const char *TokenPtr = BufferPtr;
+  assert(*TokenPtr == '&');
+  TokenPtr++;
+  if (TokenPtr == CommentEnd) {
+    formTextToken(T, TokenPtr);
+    return;
+  }
+  const char *NamePtr;
+  bool isNamed = false;
+  bool isDecimal = false;
+  char C = *TokenPtr;
+  if (isHTMLNamedCharacterReferenceCharacter(C)) {
+    NamePtr = TokenPtr;
+    TokenPtr = skipNamedCharacterReference(TokenPtr, CommentEnd);
+    isNamed = true;
+  } else if (C == '#') {
+    TokenPtr++;
+    if (TokenPtr == CommentEnd) {
+      formTextToken(T, TokenPtr);
+      return;
+    }
+    C = *TokenPtr;
+    if (isHTMLDecimalCharacterReferenceCharacter(C)) {
+      NamePtr = TokenPtr;
+      TokenPtr = skipDecimalCharacterReference(TokenPtr, CommentEnd);
+      isDecimal = true;
+    } else if (C == 'x' || C == 'X') {
+      TokenPtr++;
+      NamePtr = TokenPtr;
+      TokenPtr = skipHexCharacterReference(TokenPtr, CommentEnd);
+    } else {
+      formTextToken(T, TokenPtr);
+      return;
+    }
+  } else {
+    formTextToken(T, TokenPtr);
+    return;
+  }
+  if (NamePtr == TokenPtr || TokenPtr == CommentEnd ||
+      *TokenPtr != ';') {
+    formTextToken(T, TokenPtr);
+    return;
+  }
+  StringRef Name(NamePtr, TokenPtr - NamePtr);
+  TokenPtr++; // Skip semicolon.
+  StringRef Resolved;
+  if (isNamed)
+    Resolved = resolveHTMLNamedCharacterReference(Name);
+  else if (isDecimal)
+    Resolved = resolveHTMLDecimalCharacterReference(Name);
+  else
+    Resolved = resolveHTMLHexCharacterReference(Name);
+
+  if (Resolved.empty()) {
+    formTextToken(T, TokenPtr);
+    return;
+  }
+  formTokenWithChars(T, TokenPtr, tok::text);
+  T.setText(Resolved);
+  return;
+}
+
+void Lexer::setupAndLexHTMLStartTag(Token &T) {
+  assert(BufferPtr[0] == '<' &&
+         isHTMLIdentifierStartingCharacter(BufferPtr[1]));
   const char *TagNameEnd = skipHTMLIdentifier(BufferPtr + 2, CommentEnd);
-
   StringRef Name(BufferPtr + 1, TagNameEnd - (BufferPtr + 1));
-  formTokenWithChars(T, TagNameEnd, tok::html_tag_open);
-  T.setHTMLTagOpenName(Name);
-
-  BufferPtr = skipWhitespace(BufferPtr, CommentEnd);
-
-  if (BufferPtr != CommentEnd && *BufferPtr == '>') {
-    BufferPtr++;
+  if (!isHTMLTagName(Name)) {
+    formTextToken(T, TagNameEnd);
     return;
   }
 
-  if (BufferPtr != CommentEnd && isHTMLIdentifierCharacter(*BufferPtr))
-    State = LS_HTMLOpenTag;
+  formTokenWithChars(T, TagNameEnd, tok::html_start_tag);
+  T.setHTMLTagStartName(Name);
+
+  BufferPtr = skipWhitespace(BufferPtr, CommentEnd);
+
+  const char C = *BufferPtr;
+  if (BufferPtr != CommentEnd &&
+      (C == '>' || C == '/' || isHTMLIdentifierStartingCharacter(C)))
+    State = LS_HTMLStartTag;
 }
 
-void Lexer::lexHTMLOpenTag(Token &T) {
-  assert(State == LS_HTMLOpenTag);
+void Lexer::lexHTMLStartTag(Token &T) {
+  assert(State == LS_HTMLStartTag);
 
   const char *TokenPtr = BufferPtr;
   char C = *TokenPtr;
@@ -522,7 +648,18 @@ void Lexer::lexHTMLOpenTag(Token &T) {
     case '>':
       TokenPtr++;
       formTokenWithChars(T, TokenPtr, tok::html_greater);
-      break;
+      State = LS_Normal;
+      return;
+    case '/':
+      TokenPtr++;
+      if (TokenPtr != CommentEnd && *TokenPtr == '>') {
+        TokenPtr++;
+        formTokenWithChars(T, TokenPtr, tok::html_slash_greater);
+      } else
+        formTextToken(T, TokenPtr);
+
+      State = LS_Normal;
+      return;
     }
   }
 
@@ -535,31 +672,46 @@ void Lexer::lexHTMLOpenTag(Token &T) {
   }
 
   C = *BufferPtr;
-  if (!isHTMLIdentifierCharacter(C) &&
+  if (!isHTMLIdentifierStartingCharacter(C) &&
       C != '=' && C != '\"' && C != '\'' && C != '>') {
     State = LS_Normal;
     return;
   }
 }
 
-void Lexer::lexHTMLCloseTag(Token &T) {
+void Lexer::setupAndLexHTMLEndTag(Token &T) {
   assert(BufferPtr[0] == '<' && BufferPtr[1] == '/');
 
   const char *TagNameBegin = skipWhitespace(BufferPtr + 2, CommentEnd);
   const char *TagNameEnd = skipHTMLIdentifier(TagNameBegin, CommentEnd);
+  StringRef Name(TagNameBegin, TagNameEnd - TagNameBegin);
+  if (!isHTMLTagName(Name)) {
+    formTextToken(T, TagNameEnd);
+    return;
+  }
 
   const char *End = skipWhitespace(TagNameEnd, CommentEnd);
-  if (End != CommentEnd && *End == '>')
-    End++;
 
-  formTokenWithChars(T, End, tok::html_tag_close);
-  T.setHTMLTagCloseName(StringRef(TagNameBegin, TagNameEnd - TagNameBegin));
+  formTokenWithChars(T, End, tok::html_end_tag);
+  T.setHTMLTagEndName(Name);
+
+  if (BufferPtr != CommentEnd && *BufferPtr == '>')
+    State = LS_HTMLEndTag;
 }
 
-Lexer::Lexer(SourceLocation FileLoc, const CommentOptions &CommOpts,
+void Lexer::lexHTMLEndTag(Token &T) {
+  assert(BufferPtr != CommentEnd && *BufferPtr == '>');
+
+  formTokenWithChars(T, BufferPtr + 1, tok::html_greater);
+  State = LS_Normal;
+}
+
+Lexer::Lexer(llvm::BumpPtrAllocator &Allocator, const CommandTraits &Traits,
+             SourceLocation FileLoc,
              const char *BufferStart, const char *BufferEnd):
+    Allocator(Allocator), Traits(Traits),
     BufferStart(BufferStart), BufferEnd(BufferEnd),
-    FileLoc(FileLoc), CommOpts(CommOpts), BufferPtr(BufferStart),
+    FileLoc(FileLoc), BufferPtr(BufferStart),
     CommentState(LCS_BeforeComment), State(LS_Normal) {
 }
 
@@ -595,7 +747,8 @@ again:
         BufferPtr++;
 
       CommentState = LCS_InsideBCPLComment;
-      State = LS_Normal;
+      if (State != LS_VerbatimBlockBody && State != LS_VerbatimBlockFirstLine)
+        State = LS_Normal;
       CommentEnd = findBCPLCommentEnd(BufferPtr, BufferEnd);
       goto again;
     }
@@ -628,8 +781,9 @@ again:
       EndWhitespace++;
 
     // Turn any whitespace between comments (and there is only whitespace
-    // between them) into a newline.  We have two newlines between comments
-    // in total (first one was synthesized after a comment).
+    // between them -- guaranteed by comment extraction) into a newline.  We
+    // have two newlines between C comments in total (first one was synthesized
+    // after a comment).
     formTokenWithChars(T, EndWhitespace, tok::newline);
 
     CommentState = LCS_BeforeComment;
@@ -678,19 +832,6 @@ StringRef Lexer::getSpelling(const Token &Tok,
 
   const char *Begin = File.data() + LocInfo.second;
   return StringRef(Begin, Tok.getLength());
-}
-
-void Lexer::addVerbatimBlockCommand(StringRef BeginName, StringRef EndName) {
-  VerbatimBlockCommand VBC;
-  VBC.BeginName = BeginName;
-  VBC.EndName = EndName;
-  VerbatimBlockCommands.push_back(VBC);
-}
-
-void Lexer::addVerbatimLineCommand(StringRef Name) {
-  VerbatimLineCommand VLC;
-  VLC.Name = Name;
-  VerbatimLineCommands.push_back(VLC);
 }
 
 } // end namespace comments

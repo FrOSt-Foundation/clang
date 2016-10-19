@@ -16,6 +16,7 @@
 #define LLVM_CLANG_DIAGNOSTIC_H
 
 #include "clang/Basic/DiagnosticIDs.h"
+#include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/SourceLocation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -29,6 +30,7 @@
 namespace clang {
   class DiagnosticConsumer;
   class DiagnosticBuilder;
+  class DiagnosticOptions;
   class IdentifierInfo;
   class DeclContext;
   class LangOptions;
@@ -160,13 +162,6 @@ public:
     ak_qualtype_pair    ///< pair<QualType, QualType>
   };
 
-  /// \brief Specifies which overload candidates to display when overload
-  /// resolution fails.
-  enum OverloadsShown {
-    Ovl_All,  ///< Show all overloads.
-    Ovl_Best  ///< Show just the "best" overload candidates.
-  };
-
   /// \brief Represents on argument value, which is a union discriminated
   /// by ArgumentKind, with a value.
   typedef std::pair<ArgumentKind, intptr_t> ArgumentValue;
@@ -190,6 +185,7 @@ private:
                                     // backtrace stack, 0 -> no limit.
   ExtensionHandling ExtBehavior; // Map extensions onto warnings or errors?
   IntrusiveRefCntPtr<DiagnosticIDs> Diags;
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts;
   DiagnosticConsumer *Client;
   bool OwnsDiagClient;
   SourceManager *SourceMgr;
@@ -267,16 +263,14 @@ private:
   }
 
   void PushDiagStatePoint(DiagState *State, SourceLocation L) {
-    FullSourceLoc Loc(L, *SourceMgr);
+    FullSourceLoc Loc(L, getSourceManager());
     // Make sure that DiagStatePoints is always sorted according to Loc.
-    assert((Loc.isValid() || DiagStatePoints.empty()) &&
-           "Adding invalid loc point after another point");
-    assert((Loc.isInvalid() || DiagStatePoints.empty() ||
-            DiagStatePoints.back().Loc.isInvalid() ||
+    assert(Loc.isValid() && "Adding invalid loc point");
+    assert(!DiagStatePoints.empty() &&
+           (DiagStatePoints.back().Loc.isInvalid() ||
             DiagStatePoints.back().Loc.isBeforeInTranslationUnitThan(Loc)) &&
            "Previous point loc comes after or is the same as new one");
-    DiagStatePoints.push_back(DiagStatePoint(State,
-                                             FullSourceLoc(Loc, *SourceMgr)));
+    DiagStatePoints.push_back(DiagStatePoint(State, Loc));
   }
 
   /// \brief Finds the DiagStatePoint that contains the diagnostic state of
@@ -343,6 +337,7 @@ private:
 public:
   explicit DiagnosticsEngine(
                       const IntrusiveRefCntPtr<DiagnosticIDs> &Diags,
+                      DiagnosticOptions *DiagOpts,
                       DiagnosticConsumer *client = 0,
                       bool ShouldOwnClient = true);
   ~DiagnosticsEngine();
@@ -350,6 +345,9 @@ public:
   const IntrusiveRefCntPtr<DiagnosticIDs> &getDiagnosticIDs() const {
     return Diags;
   }
+
+  /// \brief Retrieve the diagnostic options.
+  DiagnosticOptions &getDiagnosticOptions() const { return *DiagOpts; }
 
   DiagnosticConsumer *getClient() { return Client; }
   const DiagnosticConsumer *getClient() const { return Client; }
@@ -480,10 +478,13 @@ public:
   }
   OverloadsShown getShowOverloads() const { return ShowOverloads; }
   
-  /// \brief Pretend that the last diagnostic issued was ignored.
+  /// \brief Pretend that the last diagnostic issued was ignored, so any
+  /// subsequent notes will be suppressed.
   ///
   /// This can be used by clients who suppress diagnostics themselves.
   void setLastDiagnosticIgnored() {
+    if (LastDiagLevel == DiagnosticIDs::Fatal)
+      FatalErrorOccurred = true;
     LastDiagLevel = DiagnosticIDs::Ignored;
   }
   
@@ -586,7 +587,7 @@ public:
                           const char *Argument, unsigned ArgLen,
                           const ArgumentValue *PrevArgs, unsigned NumPrevArgs,
                           SmallVectorImpl<char> &Output,
-                          SmallVectorImpl<intptr_t> &QualTypeVals) const {
+                          ArrayRef<intptr_t> QualTypeVals) const {
     ArgToStringFn(Kind, Val, Modifier, ModLen, Argument, ArgLen,
                   PrevArgs, NumPrevArgs, Output, ArgToStringCookie,
                   QualTypeVals);
@@ -763,7 +764,9 @@ protected:
   friend class Sema;
 
   /// \brief Emit the current diagnostic and clear the diagnostic state.
-  bool EmitCurrentDiagnostic();
+  ///
+  /// \param Force Emit the diagnostic regardless of suppression settings.
+  bool EmitCurrentDiagnostic(bool Force = false);
 
   unsigned getCurrentDiagID() const { return CurDiagID; }
 
@@ -833,14 +836,20 @@ class DiagnosticBuilder {
   // Emit() would end up with if we used that as our status variable.
   mutable bool IsActive;
 
-  void operator=(const DiagnosticBuilder&); // DO NOT IMPLEMENT
+  /// \brief Flag indicating that this diagnostic is being emitted via a
+  /// call to ForceEmit.
+  mutable bool IsForceEmit;
+
+  void operator=(const DiagnosticBuilder &) LLVM_DELETED_FUNCTION;
   friend class DiagnosticsEngine;
   
   DiagnosticBuilder()
-    : DiagObj(0), NumArgs(0), NumRanges(0), NumFixits(0), IsActive(false) { }
+    : DiagObj(0), NumArgs(0), NumRanges(0), NumFixits(0), IsActive(false),
+      IsForceEmit(false) { }
 
   explicit DiagnosticBuilder(DiagnosticsEngine *diagObj)
-    : DiagObj(diagObj), NumArgs(0), NumRanges(0), NumFixits(0), IsActive(true) {
+    : DiagObj(diagObj), NumArgs(0), NumRanges(0), NumFixits(0), IsActive(true),
+      IsForceEmit(false) {
     assert(diagObj && "DiagnosticBuilder requires a valid DiagnosticsEngine!");
   }
 
@@ -857,6 +866,7 @@ protected:
   void Clear() const {
     DiagObj = 0;
     IsActive = false;
+    IsForceEmit = false;
   }
 
   /// \brief Determine whether this diagnostic is still active.
@@ -879,7 +889,7 @@ protected:
     FlushCounts();
 
     // Process the diagnostic.
-    bool Result = DiagObj->EmitCurrentDiagnostic();
+    bool Result = DiagObj->EmitCurrentDiagnostic(IsForceEmit);
 
     // This diagnostic is dead.
     Clear();
@@ -893,6 +903,7 @@ public:
   DiagnosticBuilder(const DiagnosticBuilder &D) {
     DiagObj = D.DiagObj;
     IsActive = D.IsActive;
+    IsForceEmit = D.IsForceEmit;
     D.Clear();
     NumArgs = D.NumArgs;
     NumRanges = D.NumRanges;
@@ -909,6 +920,12 @@ public:
     Emit();
   }
   
+  /// \brief Forces the diagnostic to be emitted.
+  const DiagnosticBuilder &setForceEmit() const {
+    IsForceEmit = true;
+    return *this;
+  }
+
   /// \brief Conversion of DiagnosticBuilder to bool always returns \c true.
   ///
   /// This allows is to be used in boolean error contexts (where \c true is
@@ -946,6 +963,10 @@ public:
     assert(NumFixits < DiagnosticsEngine::MaxFixItHints &&
            "Too many arguments to diagnostic!");
     DiagObj->DiagFixItHints[NumFixits++] = Hint;
+  }
+
+  bool hasMaxRanges() const {
+    return NumRanges == DiagnosticsEngine::MaxRanges;
   }
 };
 
@@ -1286,6 +1307,8 @@ struct TemplateDiffTypes {
   unsigned PrintFromType : 1;
   unsigned ElideType : 1;
   unsigned ShowColors : 1;
+  // The printer sets this variable to true if the template diff was used.
+  unsigned TemplateDiffUsed : 1;
 };
 
 /// Special character that the diagnostic printer will use to toggle the bold

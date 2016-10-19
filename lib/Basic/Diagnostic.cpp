@@ -12,11 +12,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/PartialDiagnostic.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/CrashRecoveryContext.h"
+#include <cctype>
 
 using namespace clang;
 
@@ -35,9 +38,10 @@ static void DummyArgToStringFn(DiagnosticsEngine::ArgumentKind AK, intptr_t QT,
 
 DiagnosticsEngine::DiagnosticsEngine(
                        const IntrusiveRefCntPtr<DiagnosticIDs> &diags,
+                       DiagnosticOptions *DiagOpts,       
                        DiagnosticConsumer *client, bool ShouldOwnClient)
-  : Diags(diags), Client(client), OwnsDiagClient(ShouldOwnClient),
-    SourceMgr(0) {
+  : Diags(diags), DiagOpts(DiagOpts), Client(client),
+    OwnsDiagClient(ShouldOwnClient), SourceMgr(0) {
   ArgToStringFn = DummyArgToStringFn;
   ArgToStringCookie = 0;
 
@@ -118,7 +122,7 @@ void DiagnosticsEngine::Reset() {
   // Create a DiagState and DiagStatePoint representing diagnostic changes
   // through command-line.
   DiagStates.push_back(DiagState());
-  PushDiagStatePoint(&DiagStates.back(), SourceLocation());
+  DiagStatePoints.push_back(DiagStatePoint(&DiagStates.back(), FullSourceLoc()));
 }
 
 void DiagnosticsEngine::SetDelayedDiagnostic(unsigned DiagID, StringRef Arg1,
@@ -144,6 +148,9 @@ DiagnosticsEngine::GetDiagStatePointForLoc(SourceLocation L) const {
   assert(DiagStatePoints.front().Loc.isInvalid() &&
          "Should have created a DiagStatePoint for command-line");
 
+  if (!SourceMgr)
+    return DiagStatePoints.end() - 1;
+
   FullSourceLoc Loc(L, *SourceMgr);
   if (Loc.isInvalid())
     return DiagStatePoints.end() - 1;
@@ -166,8 +173,9 @@ void DiagnosticsEngine::setDiagnosticMapping(diag::kind Diag, diag::Mapping Map,
           (Map == diag::MAP_FATAL || Map == diag::MAP_ERROR)) &&
          "Cannot map errors into warnings!");
   assert(!DiagStatePoints.empty());
+  assert((L.isInvalid() || SourceMgr) && "No SourceMgr for valid location");
 
-  FullSourceLoc Loc(L, *SourceMgr);
+  FullSourceLoc Loc = SourceMgr? FullSourceLoc(L, *SourceMgr) : FullSourceLoc();
   FullSourceLoc LastStateChangePos = DiagStatePoints.back().Loc;
   // Don't allow a mapping to a warning override an error/fatal mapping.
   if (Map == diag::MAP_WARNING) {
@@ -382,17 +390,34 @@ void DiagnosticsEngine::Report(const StoredDiagnostic &storedDiag) {
   CurDiagID = ~0U;
 }
 
-bool DiagnosticsEngine::EmitCurrentDiagnostic() {
-  // Process the diagnostic, sending the accumulated information to the
-  // DiagnosticConsumer.
-  bool Emitted = ProcessDiag();
+bool DiagnosticsEngine::EmitCurrentDiagnostic(bool Force) {
+  assert(getClient() && "DiagnosticClient not set!");
+
+  bool Emitted;
+  if (Force) {
+    Diagnostic Info(this);
+
+    // Figure out the diagnostic level of this message.
+    DiagnosticIDs::Level DiagLevel
+      = Diags->getDiagnosticLevel(Info.getID(), Info.getLocation(), *this);
+
+    Emitted = (DiagLevel != DiagnosticIDs::Ignored);
+    if (Emitted) {
+      // Emit the diagnostic regardless of suppression level.
+      Diags->EmitDiag(*this, DiagLevel);
+    }
+  } else {
+    // Process the diagnostic, sending the accumulated information to the
+    // DiagnosticConsumer.
+    Emitted = ProcessDiag();
+  }
 
   // Clear out the current diagnostic object.
   unsigned DiagID = CurDiagID;
   Clear();
 
   // If there was a delayed diagnostic, emit it now.
-  if (DelayedDiagID && DelayedDiagID != DiagID)
+  if (!Force && DelayedDiagID && DelayedDiagID != DiagID)
     ReportDelayed();
 
   return Emitted;
@@ -493,23 +518,7 @@ static void HandleOrdinalModifier(unsigned ValNo,
 
   // We could use text forms for the first N ordinals, but the numeric
   // forms are actually nicer in diagnostics because they stand out.
-  Out << ValNo;
-
-  // It is critically important that we do this perfectly for
-  // user-written sequences with over 100 elements.
-  switch (ValNo % 100) {
-  case 11:
-  case 12:
-  case 13:
-    Out << "th"; return;
-  default:
-    switch (ValNo % 10) {
-    case 1: Out << "st"; return;
-    case 2: Out << "nd"; return;
-    case 3: Out << "rd"; return;
-    default: Out << "th"; return;
-    }
-  }
+  Out << ValNo << llvm::getOrdinalSuffix(ValNo);
 }
 
 
@@ -821,13 +830,15 @@ FormatDiagnostic(const char *DiagStr, const char *DiagEnd,
       TDT.ToType = getRawArg(ArgNo2);
       TDT.ElideType = getDiags()->ElideType;
       TDT.ShowColors = getDiags()->ShowColors;
+      TDT.TemplateDiffUsed = false;
       intptr_t val = reinterpret_cast<intptr_t>(&TDT);
 
       const char *ArgumentEnd = Argument + ArgumentLen;
       const char *Pipe = ScanFormat(Argument, ArgumentEnd, '|');
 
-      // Print the tree.
-      if (getDiags()->PrintTemplateTree) {
+      // Print the tree.  If this diagnostic already has a tree, skip the
+      // second tree.
+      if (getDiags()->PrintTemplateTree && Tree.empty()) {
         TDT.PrintFromType = true;
         TDT.PrintTree = true;
         getDiags()->ConvertArgToString(Kind, val,
@@ -859,6 +870,10 @@ FormatDiagnostic(const char *DiagStr, const char *DiagEnd,
                                      Argument, ArgumentLen,
                                      FormattedArgs.data(), FormattedArgs.size(),
                                      OutStr, QualTypeVals);
+      if (!TDT.TemplateDiffUsed)
+        FormattedArgs.push_back(std::make_pair(DiagnosticsEngine::ak_qualtype,
+                                               TDT.FromType));
+
       // Append middle text
       FormatDiagnostic(FirstDollar + 1, SecondDollar, OutStr);
 
@@ -869,6 +884,10 @@ FormatDiagnostic(const char *DiagStr, const char *DiagEnd,
                                      Argument, ArgumentLen,
                                      FormattedArgs.data(), FormattedArgs.size(),
                                      OutStr, QualTypeVals);
+      if (!TDT.TemplateDiffUsed)
+        FormattedArgs.push_back(std::make_pair(DiagnosticsEngine::ak_qualtype,
+                                               TDT.ToType));
+
       // Append end text
       FormatDiagnostic(SecondDollar + 1, Pipe, OutStr);
       break;

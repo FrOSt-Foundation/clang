@@ -21,6 +21,7 @@
 #include <utility>
 #include <functional>
 #include <cassert>
+#include <string>
 
 namespace llvm {
   class MemoryBuffer;
@@ -166,11 +167,12 @@ public:
 
   /// getFromPtrEncoding - Turn a pointer encoding of a SourceLocation object
   /// into a real SourceLocation.
-  static SourceLocation getFromPtrEncoding(void *Encoding) {
+  static SourceLocation getFromPtrEncoding(const void *Encoding) {
     return getFromRawEncoding((unsigned)(uintptr_t)Encoding);
   }
 
   void print(raw_ostream &OS, const SourceManager &SM) const;
+  LLVM_ATTRIBUTE_USED std::string printToString(const SourceManager &SM) const;
   void dump(const SourceManager &SM) const;
 };
 

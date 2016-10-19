@@ -1,8 +1,10 @@
 // RUN: %clang_cc1 -x objective-c++ -std=c++11 -fsyntax-only -Werror -verify -Wno-objc-root-class %s
+// expected-no-diagnostics
 // rdar://10387088
 
 struct X {
 X();
+void SortWithCollator();
 };
 
 @interface MyClass
@@ -39,5 +41,9 @@ static int test() {
 int x{17};
 
 X::X() = default;
-
+void X::SortWithCollator() {}
+// pr13418
+namespace {
+     int CurrentTabId() {return 0;}
+}
 @end

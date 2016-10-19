@@ -21,14 +21,14 @@
 #include "clang/Basic/TargetInfo.h"
 #include "llvm/LLVMContext.h"
 #include "llvm/Module.h"
-#include "llvm/Target/TargetData.h"
+#include "llvm/DataLayout.h"
 #include "llvm/ADT/OwningPtr.h"
 using namespace clang;
 
 namespace {
   class CodeGeneratorImpl : public CodeGenerator {
     DiagnosticsEngine &Diags;
-    OwningPtr<const llvm::TargetData> TD;
+    OwningPtr<const llvm::DataLayout> TD;
     ASTContext *Ctx;
     const CodeGenOptions CodeGenOpts;  // Intentionally copied in.
   protected:
@@ -78,16 +78,16 @@ namespace {
     /// (because these can be defined in declspecs).
     virtual void HandleTagDeclDefinition(TagDecl *D) {
       Builder->UpdateCompletedType(D);
-      
-      // In C++, we may have member functions that need to be emitted at this 
+
+      // In C++, we may have member functions that need to be emitted at this
       // point.
       if (Ctx->getLangOpts().CPlusPlus && !D->isDependentContext()) {
-        for (DeclContext::decl_iterator M = D->decls_begin(), 
+        for (DeclContext::decl_iterator M = D->decls_begin(),
                                      MEnd = D->decls_end();
              M != MEnd; ++M)
           if (CXXMethodDecl *Method = dyn_cast<CXXMethodDecl>(*M))
             if (Method->doesThisDeclarationHaveABody() &&
-                (Method->hasAttr<UsedAttr>() || 
+                (Method->hasAttr<UsedAttr>() ||
                  Method->hasAttr<ConstructorAttr>()))
               Builder->EmitTopLevelDecl(Method);
       }

@@ -8,8 +8,13 @@ add_clang_library(clangAST
   ASTImporter.cpp
   AttrImpl.cpp
   CXXInheritance.cpp
+  Comment.cpp
   CommentBriefParser.cpp
+  CommentCommandTraits.cpp
+  CommentDumper.cpp
   CommentLexer.cpp
+  CommentParser.cpp
+  CommentSema.cpp
   Decl.cpp
   DeclarationName.cpp
   DeclBase.cpp
@@ -59,8 +64,15 @@ add_dependencies(clangAST
   ClangAttrClasses
   ClangAttrList
   ClangAttrImpl
-  ClangDiagnosticAST
+  ClangCommentCommandInfo
+  ClangCommentNodes
+  ClangCommentHTMLTags
+  ClangCommentHTMLTagsProperties
   ClangDeclNodes
+  ClangDiagnosticAST
+  ClangDiagnosticComment
+  ClangDiagnosticCommon
+  ClangDiagnosticSema
   ClangStmtNodes
   )
 

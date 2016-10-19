@@ -231,3 +231,22 @@ def test_result_type():
     assert foo is not None
     t = foo.result_type
     assert t.kind == TypeKind.INT
+
+def test_get_tokens():
+    """Ensure we can map cursors back to tokens."""
+    tu = get_tu('int foo(int i);')
+    foo = get_cursor(tu, 'foo')
+
+    tokens = list(foo.get_tokens())
+    assert len(tokens) == 7
+    assert tokens[0].spelling == 'int'
+    assert tokens[1].spelling == 'foo'
+
+def test_get_arguments():
+    tu = get_tu('void foo(int i, int j);')
+    foo = get_cursor(tu, 'foo')
+    arguments = list(foo.get_arguments())
+
+    assert len(arguments) == 2
+    assert arguments[0].spelling == "i"
+    assert arguments[1].spelling == "j"

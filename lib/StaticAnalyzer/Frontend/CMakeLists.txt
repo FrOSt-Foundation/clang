@@ -13,7 +13,10 @@ add_dependencies(clangStaticAnalyzerFrontend
   clangStaticAnalyzerCore
   ClangAttrClasses
   ClangAttrList
+  ClangCommentNodes
   ClangDeclNodes
+  ClangDiagnosticCommon
+  ClangDiagnosticFrontend
   ClangStmtNodes
   )
 
@@ -22,6 +25,7 @@ target_link_libraries(clangStaticAnalyzerFrontend
   clangLex
   clangAST
   clangFrontend
-  clangRewrite
+  clangRewriteCore
+  clangRewriteFrontend
   clangStaticAnalyzerCheckers
   )

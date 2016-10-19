@@ -35,6 +35,7 @@
 #include "clang/Basic/FileManager.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Driver/Util.h"
+#include "clang/Frontend/FrontendAction.h"
 #include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include <string>
@@ -73,19 +74,28 @@ public:
 template <typename T>
 FrontendActionFactory *newFrontendActionFactory();
 
+/// \brief Called at the end of each source file when used with
+/// \c newFrontendActionFactory.
+class EndOfSourceFileCallback {
+public:
+  virtual ~EndOfSourceFileCallback() {}
+  virtual void run() = 0;
+};
+
 /// \brief Returns a new FrontendActionFactory for any type that provides an
-/// implementation of newFrontendAction().
+/// implementation of newASTConsumer().
 ///
-/// FactoryT must implement: FrontendAction *newFrontendAction().
+/// FactoryT must implement: ASTConsumer *newASTConsumer().
 ///
 /// Example:
-/// struct ProvidesFrontendActions {
-///   FrontendAction *newFrontendAction();
+/// struct ProvidesASTConsumers {
+///   clang::ASTConsumer *newASTConsumer();
 /// } Factory;
 /// FrontendActionFactory *FactoryAdapter =
 ///   newFrontendActionFactory(&Factory);
 template <typename FactoryT>
-FrontendActionFactory *newFrontendActionFactory(FactoryT *ActionFactory);
+inline FrontendActionFactory *newFrontendActionFactory(
+    FactoryT *ConsumerFactory, EndOfSourceFileCallback *EndCallback = NULL);
 
 /// \brief Runs (and deletes) the tool on 'Code' with the -fsyntax-only flag.
 ///
@@ -96,6 +106,19 @@ FrontendActionFactory *newFrontendActionFactory(FactoryT *ActionFactory);
 /// \return - True if 'ToolAction' was successfully executed.
 bool runToolOnCode(clang::FrontendAction *ToolAction, const Twine &Code,
                    const Twine &FileName = "input.cc");
+
+/// \brief Runs (and deletes) the tool on 'Code' with the -fsyntax-only flag and
+///        with additional other flags.
+///
+/// \param ToolAction The action to run over the code.
+/// \param Code C++ code.
+/// \param Args Additional flags to pass on.
+/// \param FileName The file name which 'Code' will be mapped as.
+///
+/// \return - True if 'ToolAction' was successfully executed.
+bool runToolOnCodeWithArgs(clang::FrontendAction *ToolAction, const Twine &Code,
+                           const std::vector<std::string> &Args,
+                           const Twine &FileName = "input.cc");
 
 /// \brief Utility to run a FrontendAction in a single clang invocation.
 class ToolInvocation {
@@ -201,22 +224,63 @@ FrontendActionFactory *newFrontendActionFactory() {
 }
 
 template <typename FactoryT>
-FrontendActionFactory *newFrontendActionFactory(FactoryT *ActionFactory) {
+inline FrontendActionFactory *newFrontendActionFactory(
+    FactoryT *ConsumerFactory, EndOfSourceFileCallback *EndCallback) {
   class FrontendActionFactoryAdapter : public FrontendActionFactory {
   public:
-    explicit FrontendActionFactoryAdapter(FactoryT *ActionFactory)
-      : ActionFactory(ActionFactory) {}
+    explicit FrontendActionFactoryAdapter(FactoryT *ConsumerFactory,
+                                          EndOfSourceFileCallback *EndCallback)
+      : ConsumerFactory(ConsumerFactory), EndCallback(EndCallback) {}
 
     virtual clang::FrontendAction *create() {
-      return ActionFactory->newFrontendAction();
+      return new ConsumerFactoryAdaptor(ConsumerFactory, EndCallback);
     }
 
   private:
-    FactoryT *ActionFactory;
+    class ConsumerFactoryAdaptor : public clang::ASTFrontendAction {
+    public:
+      ConsumerFactoryAdaptor(FactoryT *ConsumerFactory,
+                             EndOfSourceFileCallback *EndCallback)
+        : ConsumerFactory(ConsumerFactory), EndCallback(EndCallback) {}
+
+      clang::ASTConsumer *CreateASTConsumer(clang::CompilerInstance &,
+                                            llvm::StringRef) {
+        return ConsumerFactory->newASTConsumer();
+      }
+
+    protected:
+      virtual void EndSourceFileAction() {
+        if (EndCallback != NULL)
+          EndCallback->run();
+        clang::ASTFrontendAction::EndSourceFileAction();
+      }
+
+    private:
+      FactoryT *ConsumerFactory;
+      EndOfSourceFileCallback *EndCallback;
+    };
+    FactoryT *ConsumerFactory;
+    EndOfSourceFileCallback *EndCallback;
   };
 
-  return new FrontendActionFactoryAdapter(ActionFactory);
+  return new FrontendActionFactoryAdapter(ConsumerFactory, EndCallback);
 }
+
+/// \brief Returns the absolute path of \c File, by prepending it with
+/// the current directory if \c File is not absolute.
+///
+/// Otherwise returns \c File.
+/// If 'File' starts with "./", the returned path will not contain the "./".
+/// Otherwise, the returned path will contain the literal path-concatenation of
+/// the current directory and \c File.
+///
+/// The difference to llvm::sys::fs::make_absolute is that we prefer
+/// ::getenv("PWD") if available.
+/// FIXME: Make this functionality available from llvm::sys::fs and delete
+///        this function.
+///
+/// \param File Either an absolute or relative path.
+std::string getAbsolutePath(StringRef File);
 
 } // end namespace tooling
 } // end namespace clang

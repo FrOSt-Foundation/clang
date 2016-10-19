@@ -190,7 +190,7 @@ def Availability : InheritableAttr {
 [{static llvm::StringRef getPrettyPlatformName(llvm::StringRef Platform) {
     return llvm::StringSwitch<llvm::StringRef>(Platform)
              .Case("ios", "iOS")
-             .Case("macosx", "Mac OS X")
+             .Case("macosx", "OS X")
              .Default(llvm::StringRef());
 } }];
 }
@@ -344,6 +344,11 @@ def FastCall : InheritableAttr {
 def Final : InheritableAttr {
   let Spellings = [];
   let SemaHandler = 0;
+}
+
+def MinSize : InheritableAttr {
+  let Spellings = [GNU<"minsize">];
+  let Subjects = [Function];
 }
 
 def Format : InheritableAttr {
@@ -533,6 +538,11 @@ def ObjCReturnsInnerPointer : Attr {
   let Subjects = [ObjCMethod];
 }
 
+def ObjCRequiresSuper : InheritableAttr {
+  let Spellings = [GNU<"objc_requires_super">];
+  let Subjects = [ObjCMethod];
+}
+
 def ObjCRootClass : Attr {
   let Spellings = [GNU<"objc_root_class">];
   let Subjects = [ObjCInterface];
@@ -561,6 +571,10 @@ def Packed : InheritableAttr {
   let Spellings = [GNU<"packed">];
 }
 
+def PnaclCall : InheritableAttr {
+  let Spellings = [GNU<"pnaclcall">];
+}
+
 def Pcs : InheritableAttr {
   let Spellings = [GNU<"pcs">];
   let Args = [EnumArgument<"PCS", "PCSType",
@@ -580,6 +594,13 @@ def Regparm : InheritableAttr {
 def ReqdWorkGroupSize : InheritableAttr {
   let Spellings = [GNU<"reqd_work_group_size">];
   let Args = [UnsignedArgument<"XDim">, UnsignedArgument<"YDim">,
+              UnsignedArgument<"ZDim">];
+}
+
+def WorkGroupSizeHint :  InheritableAttr {
+  let Spellings = [GNU<"work_group_size_hint">];
+  let Args = [UnsignedArgument<"XDim">, 
+              UnsignedArgument<"YDim">,
               UnsignedArgument<"ZDim">];
 }
 
@@ -822,6 +843,27 @@ def SharedLocksRequired : InheritableAttr {
   let Args = [VariadicExprArgument<"Args">];
   let LateParsed = 1;
   let TemplateDependent = 1;
+}
+
+// Type safety attributes for `void *' pointers and type tags.
+
+def ArgumentWithTypeTag : InheritableAttr {
+  let Spellings = [GNU<"argument_with_type_tag">,
+                   GNU<"pointer_with_type_tag">];
+  let Args = [IdentifierArgument<"ArgumentKind">,
+              UnsignedArgument<"ArgumentIdx">,
+              UnsignedArgument<"TypeTagIdx">,
+              BoolArgument<"IsPointer">];
+  let Subjects = [Function];
+}
+
+def TypeTagForDatatype : InheritableAttr {
+  let Spellings = [GNU<"type_tag_for_datatype">];
+  let Args = [IdentifierArgument<"ArgumentKind">,
+              TypeArgument<"MatchingCType">,
+              BoolArgument<"LayoutCompatible">,
+              BoolArgument<"MustBeNull">];
+  let Subjects = [Var];
 }
 
 // Microsoft-related attributes

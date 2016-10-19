@@ -78,6 +78,13 @@ uint64_t CGObjCRuntime::ComputeIvarBaseOffset(CodeGen::CodeGenModule &CGM,
     CGM.getContext().getCharWidth();
 }
 
+unsigned CGObjCRuntime::ComputeBitfieldBitOffset(
+    CodeGen::CodeGenModule &CGM,
+    const ObjCInterfaceDecl *ID,
+    const ObjCIvarDecl *Ivar) {
+  return LookupFieldBitOffset(CGM, ID, ID->getImplementation(), Ivar);
+}
+
 LValue CGObjCRuntime::EmitValueForIvarAtOffset(CodeGen::CodeGenFunction &CGF,
                                                const ObjCInterfaceDecl *OID,
                                                llvm::Value *BaseValue,
@@ -358,17 +365,17 @@ CGObjCRuntime::getMessageSendInfo(const ObjCMethodDecl *method,
     // Otherwise, there is.
     FunctionType::ExtInfo einfo = signature.getExtInfo();
     const CGFunctionInfo &argsInfo =
-      CGM.getTypes().arrangeFunctionCall(resultType, callArgs, einfo,
-                                         signature.getRequiredArgs());
+      CGM.getTypes().arrangeFreeFunctionCall(resultType, callArgs, einfo,
+                                             signature.getRequiredArgs());
 
     return MessageSendInfo(argsInfo, signatureType);
   }
 
   // There's no method;  just use a default CC.
   const CGFunctionInfo &argsInfo =
-    CGM.getTypes().arrangeFunctionCall(resultType, callArgs, 
-                                       FunctionType::ExtInfo(),
-                                       RequiredArgs::All);
+    CGM.getTypes().arrangeFreeFunctionCall(resultType, callArgs, 
+                                           FunctionType::ExtInfo(),
+                                           RequiredArgs::All);
 
   // Derive the signature to call from that.
   llvm::PointerType *signatureType =
