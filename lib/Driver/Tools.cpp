@@ -1749,9 +1749,11 @@ static bool shouldUseFramePointer(const ArgList &Args,
     return A->getOption().matches(options::OPT_fno_omit_frame_pointer);
 
   // Don't use a frame pointer on linux x86 and x86_64 if optimizing.
-  if ((Triple.getArch() == llvm::Triple::x86_64 ||
+  // Same for DCPU16.
+  if (((Triple.getArch() == llvm::Triple::x86_64 ||
        Triple.getArch() == llvm::Triple::x86) &&
-      Triple.getOS() == llvm::Triple::Linux) {
+      Triple.getOS() == llvm::Triple::Linux) ||
+       (Triple.getArch() == llvm::Triple::dcpu16)) {
     if (Arg *A = Args.getLastArg(options::OPT_O_Group))
       if (!A->getOption().matches(options::OPT_O0))
         return false;
@@ -3366,6 +3368,12 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
       CmdArgs.push_back("-fno-builtin-strcpy");
   }
 #endif
+
+  // Default to -fno-builtin on DCPU16
+  if (getToolChain().getTriple().getArch() == llvm::Triple::dcpu16) {
+    if (!Args.hasArg(options::OPT_fbuiltin))
+      CmdArgs.push_back("-fno-builtin");
+  }
 
   // Only allow -traditional or -traditional-cpp outside in preprocessing modes.
   if (Arg *A = Args.getLastArg(options::OPT_traditional,

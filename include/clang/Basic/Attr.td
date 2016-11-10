@@ -335,6 +335,11 @@ def OpenCLImageAccess : Attr {
   let Args = [IntArgument<"Access">];
 }
 
+def DCPU16Interrupt : InheritableAttr {
+  let Spellings = [GNU<"dcpu16_intr">];
+  let SemaHandler = 0;
+}
+
 def Deprecated : InheritableAttr {
   let Spellings = [GNU<"deprecated">, CXX11<"gnu", "deprecated">];
   let Args = [StringArgument<"Message">];

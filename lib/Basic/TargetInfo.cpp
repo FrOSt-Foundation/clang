@@ -32,6 +32,8 @@ TargetInfo::TargetInfo(const std::string &T) : TargetOpts(), Triple(T)
   TLSSupported = true;
   NoAsmVariants = false;
   PointerWidth = PointerAlign = 32;
+  CharWidth = CharAlign = 8;
+  ShortWidth = ShortAlign = 16;
   BoolWidth = BoolAlign = 8;
   IntWidth = IntAlign = 32;
   LongWidth = LongAlign = 32;
@@ -72,6 +74,7 @@ TargetInfo::TargetInfo(const std::string &T) : TargetOpts(), Triple(T)
   LongDoubleFormat = &llvm::APFloat::IEEEdouble;
   DescriptionString = "E-p:32:32:32-i1:8:8-i8:8:8-i16:16:16-i32:32:32-"
                       "i64:64:64-f32:32:32-f64:64:64-n32";
+  BitsPerByte = 8;
   UserLabelPrefix = "_";
   MCountName = "mcount";
   RegParmMax = 0;

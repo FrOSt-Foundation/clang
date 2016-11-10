@@ -907,6 +907,8 @@ llvm::Type *CGRecordLayoutBuilder::getByteArrayType(CharUnits numBytes) {
   assert(!numBytes.isZero() && "Empty byte arrays aren't allowed.");
 
   llvm::Type *Ty = llvm::Type::getInt8Ty(Types.getLLVMContext());
+  llvm::Type *Ty = llvm::Type::getIntNTy(Types.getLLVMContext(),
+                                         Types.getTarget().getCharWidth());
   if (numBytes > CharUnits::One())
     Ty = llvm::ArrayType::get(Ty, numBytes.getQuantity());
 

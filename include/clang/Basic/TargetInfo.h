@@ -57,6 +57,8 @@ protected:
   bool NoAsmVariants;  // True if {|} are normal characters.
   unsigned char PointerWidth, PointerAlign;
   unsigned char BoolWidth, BoolAlign;
+  unsigned char CharWidth, CharAlign;
+  unsigned char ShortWidth, ShortAlign;
   unsigned char IntWidth, IntAlign;
   unsigned char HalfWidth, HalfAlign;
   unsigned char FloatWidth, FloatAlign;
@@ -70,6 +72,7 @@ protected:
   unsigned char MaxAtomicPromoteWidth, MaxAtomicInlineWidth;
   unsigned short MaxVectorAlign;
   const char *DescriptionString;
+  unsigned BitsPerByte;
   const char *UserLabelPrefix;
   const char *MCountName;
   const llvm::fltSemantics *HalfFormat, *FloatFormat, *DoubleFormat,
@@ -243,8 +246,8 @@ public:
   /// \brief Return the alignment of '_Bool' and C++ 'bool' for this target.
   unsigned getBoolAlign() const { return BoolAlign; }
 
-  unsigned getCharWidth() const { return 8; } // FIXME
-  unsigned getCharAlign() const { return 8; } // FIXME
+  unsigned getCharWidth() const { return CharWidth; } // FIXME
+  unsigned getCharAlign() const { return CharAlign; } // FIXME
 
   /// \brief Return the size of 'signed short' and 'unsigned short' for this
   /// target, in bits.
@@ -339,6 +342,10 @@ public:
   /// \brief Return the size of intmax_t and uintmax_t for this target, in bits.
   unsigned getIntMaxTWidth() const {
     return getTypeWidth(IntMaxType);
+  }
+
+  unsigned getBitsPerByte() const {
+    return BitsPerByte;
   }
 
   // Return the size of unwind_word for this target.
